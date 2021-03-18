@@ -11,6 +11,8 @@ module Streamly.Crypto.Cipher.Array where
 
 import Control.Monad.IO.Class (MonadIO)
 import Crypto.Cipher.Types (BlockCipher, IV)
+import Crypto.Data.Padding (Format)
+import qualified Crypto.Data.Padding as Padding
 import qualified Crypto.Cipher.Types as BlockCipher
 import Data.Word (Word8)
 import Streamly (SerialT)
@@ -97,78 +99,214 @@ ctrCombineArray ::
     -> Array Word8
 ctrCombineArray = BlockCipher.ctrCombine
 
-ecbEncrypt ::
+ecbEncrypt_ ::
    (BlockCipher cipher, MonadIO m)
    => cipher
    -> SerialT m (Array Word8)
    -> SerialT m (Array Word8)
-ecbEncrypt cipher =
+ecbEncrypt_ cipher =
     Streamly.map (ecbEncryptArray cipher)
-    . Streamly.arraysOf 256
+    . Streamly.arraysOf (BlockCipher.blockSize cipher)
+    . StreamD.fromStreamD
+    . Array.flattenArrays
+    . StreamD.toStreamD
+
+ecbDecrypt_ ::
+   (BlockCipher cipher, MonadIO m)
+   => cipher
+   -> SerialT m (Array Word8)
+   -> SerialT m (Array Word8)
+ecbDecrypt_ cipher =
+    Streamly.map (ecbDecryptArray cipher)
+    . Streamly.arraysOf (BlockCipher.blockSize cipher)
+    . StreamD.fromStreamD
+    . Array.flattenArrays
+    . StreamD.toStreamD
+
+cbcEncrypt_ ::
+   (BlockCipher cipher, MonadIO m)
+   => cipher
+   -> IV cipher
+   -> SerialT m (Array Word8)
+   -> SerialT m (Array Word8)
+cbcEncrypt_ cipher iv =
+    Streamly.map (cbcEncryptArray cipher iv)
+    . Streamly.arraysOf (BlockCipher.blockSize cipher)
+    . StreamD.fromStreamD
+    . Array.flattenArrays
+    . StreamD.toStreamD
+
+cbcDecrypt_ ::
+   (BlockCipher cipher, MonadIO m)
+   => cipher
+   -> IV cipher
+   -> SerialT m (Array Word8)
+   -> SerialT m (Array Word8)
+cbcDecrypt_ cipher iv =
+    Streamly.map (cbcDecryptArray cipher iv)
+    . Streamly.arraysOf (BlockCipher.blockSize cipher)
+    . StreamD.fromStreamD
+    . Array.flattenArrays
+    . StreamD.toStreamD
+
+cfbEncrypt_ ::
+   (BlockCipher cipher, MonadIO m)
+   => cipher
+   -> IV cipher
+   -> SerialT m (Array Word8)
+   -> SerialT m (Array Word8)
+cfbEncrypt_ cipher iv =
+    Streamly.map (cfbEncryptArray cipher iv)
+    . Streamly.arraysOf (BlockCipher.blockSize cipher)
+    . StreamD.fromStreamD
+    . Array.flattenArrays
+    . StreamD.toStreamD
+
+cfbDecrypt_ ::
+   (BlockCipher cipher, MonadIO m)
+   => cipher
+   -> IV cipher
+   -> SerialT m (Array Word8)
+   -> SerialT m (Array Word8)
+cfbDecrypt_ cipher iv =
+    Streamly.map (cfbDecryptArray cipher iv)
+    . Streamly.arraysOf (BlockCipher.blockSize cipher)
+    . StreamD.fromStreamD
+    . Array.flattenArrays
+    . StreamD.toStreamD
+
+data MapLast s x = Begin s | Continue x s | End
+
+mapLastD :: Monad m => (Array Word8 -> Array Word8) -> StreamD.Stream m (Array Word8) -> StreamD.Stream m (Array Word8)
+mapLastD f (StreamD.Stream stepa state) = StreamD.Stream stepb (Begin state)
+    where
+    stepb gst (Begin st) = do
+        r <- stepa gst st
+        return $ case r of
+            StreamD.Yield x s -> StreamD.Skip $ Continue x s
+            StreamD.Skip s -> StreamD.Skip $ Begin s
+            StreamD.Stop -> StreamD.Stop
+    stepb gst (Continue prev st) = do
+        r <- stepa gst st
+        return $ case r of
+            StreamD.Yield x s -> StreamD.Yield prev (Continue x s)
+            StreamD.Skip s -> StreamD.Skip $ Continue prev s
+            StreamD.Stop -> StreamD.Yield (f prev) End
+    stepb _ End = return StreamD.Stop
+
+mapLast ::
+    Monad m
+    => (Array Word8 -> Array Word8)
+    -> SerialT m (Array Word8)
+    -> SerialT m (Array Word8)
+mapLast f = StreamD.fromStreamD . mapLastD f . StreamD.toStreamD
+
+maybeDropLastD :: Monad m => (Array Word8 -> Maybe (Array Word8)) -> StreamD.Stream m (Array Word8) -> StreamD.Stream m (Array Word8)
+maybeDropLastD f (StreamD.Stream stepa state) = StreamD.Stream stepb (Begin state)
+    where
+    stepb gst (Begin st) = do
+        r <- stepa gst st
+        return $ case r of
+            StreamD.Yield x s -> StreamD.Skip $ Continue x s
+            StreamD.Skip s -> StreamD.Skip $ Begin s
+            StreamD.Stop -> StreamD.Stop
+    stepb gst (Continue prev st) = do
+        r <- stepa gst st
+        return $ case r of
+            StreamD.Yield x s -> StreamD.Yield prev (Continue x s)
+            StreamD.Skip s -> StreamD.Skip $ Continue prev s
+            StreamD.Stop -> case f prev of
+                Just content -> StreamD.Yield content End
+                _            -> StreamD.Stop
+    stepb _ End = return StreamD.Stop
+
+maybeDropLast :: Monad m => (Array Word8 -> Maybe (Array Word8)) -> SerialT m (Array Word8) -> SerialT m (Array Word8)
+maybeDropLast f = StreamD.fromStreamD . maybeDropLastD f . StreamD.toStreamD
+
+ecbEncrypt ::
+   (BlockCipher cipher, MonadIO m)
+   => Format -- ^ Padding format to use.
+   -> cipher
+   -> SerialT m (Array Word8)
+   -> SerialT m (Array Word8)
+ecbEncrypt format cipher =
+    Streamly.map (ecbEncryptArray cipher)
+    . mapLast (Padding.pad format)
+    . Streamly.arraysOf (BlockCipher.blockSize cipher)
     . StreamD.fromStreamD
     . Array.flattenArrays
     . StreamD.toStreamD
 
 ecbDecrypt ::
    (BlockCipher cipher, MonadIO m)
-   => cipher
+   => Format
+   -> cipher
    -> SerialT m (Array Word8)
    -> SerialT m (Array Word8)
-ecbDecrypt cipher =
-    Streamly.map (ecbDecryptArray cipher)
-    . Streamly.arraysOf 256
+ecbDecrypt format cipher =
+    maybeDropLast (Padding.unpad format)
+    . Streamly.map (ecbDecryptArray cipher)
+    . Streamly.arraysOf (BlockCipher.blockSize cipher)
     . StreamD.fromStreamD
     . Array.flattenArrays
     . StreamD.toStreamD
 
 cbcEncrypt ::
    (BlockCipher cipher, MonadIO m)
-   => cipher
+   => Format
+   -> cipher
    -> IV cipher
    -> SerialT m (Array Word8)
    -> SerialT m (Array Word8)
-cbcEncrypt cipher iv =
+cbcEncrypt format cipher iv =
     Streamly.map (cbcEncryptArray cipher iv)
-    . Streamly.arraysOf 256
+    . mapLast (Padding.pad format)
+    . Streamly.arraysOf (BlockCipher.blockSize cipher)
     . StreamD.fromStreamD
     . Array.flattenArrays
     . StreamD.toStreamD
 
 cbcDecrypt ::
    (BlockCipher cipher, MonadIO m)
-   => cipher
+   => Format
+   -> cipher
    -> IV cipher
    -> SerialT m (Array Word8)
    -> SerialT m (Array Word8)
-cbcDecrypt cipher iv =
-    Streamly.map (cbcDecryptArray cipher iv)
-    . Streamly.arraysOf 256
+cbcDecrypt format cipher iv =
+    maybeDropLast (Padding.unpad format)
+    . Streamly.map (cbcDecryptArray cipher iv)
+    . Streamly.arraysOf (BlockCipher.blockSize cipher)
     . StreamD.fromStreamD
     . Array.flattenArrays
     . StreamD.toStreamD
 
 cfbEncrypt ::
    (BlockCipher cipher, MonadIO m)
-   => cipher
+   => Format
+   -> cipher
    -> IV cipher
    -> SerialT m (Array Word8)
    -> SerialT m (Array Word8)
-cfbEncrypt cipher iv =
+cfbEncrypt format cipher iv =
     Streamly.map (cfbEncryptArray cipher iv)
-    . Streamly.arraysOf 256
+    . mapLast (Padding.pad format)
+    . Streamly.arraysOf (BlockCipher.blockSize cipher)
     . StreamD.fromStreamD
     . Array.flattenArrays
     . StreamD.toStreamD
 
 cfbDecrypt ::
    (BlockCipher cipher, MonadIO m)
-   => cipher
+   => Format
+   -> cipher
    -> IV cipher
    -> SerialT m (Array Word8)
    -> SerialT m (Array Word8)
-cfbDecrypt cipher iv =
-    Streamly.map (cfbDecryptArray cipher iv)
-    . Streamly.arraysOf 256
+cfbDecrypt format cipher iv =
+    maybeDropLast (Padding.unpad format)
+    . Streamly.map (cfbDecryptArray cipher iv)
+    . Streamly.arraysOf (BlockCipher.blockSize cipher)
     . StreamD.fromStreamD
     . Array.flattenArrays
     . StreamD.toStreamD
@@ -181,7 +319,7 @@ ctrCombine ::
    -> SerialT m (Array Word8)
 ctrCombine cipher iv =
     Streamly.map (ctrCombineArray cipher iv)
-    . Streamly.arraysOf 256
+    . Streamly.arraysOf (BlockCipher.blockSize cipher)
     . StreamD.fromStreamD
     . Array.flattenArrays
     . StreamD.toStreamD
